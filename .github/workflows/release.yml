@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: bitwarden-merger
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+          mkdir dist
+          cp target/x86_64-unknown-linux-gnu/release/$BIN_NAME dist/
+          cp README.md LICENSE dist/
+          tar -czf "$BIN_NAME-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C dist .
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir dist
+          lipo -create -output dist/$BIN_NAME \
+            target/aarch64-apple-darwin/release/$BIN_NAME \
+            target/x86_64-apple-darwin/release/$BIN_NAME
+          cp README.md LICENSE dist/
+          tar -czf "$BIN_NAME-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C dist .
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/$env:BIN_NAME.exe" dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "$env:BIN_NAME-$env:GITHUB_REF_NAME-${{ matrix.name }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
