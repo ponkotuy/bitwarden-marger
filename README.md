@@ -12,6 +12,25 @@ Bitwarden の保管庫に大量にできてしまった「同じパスワード�
   統合元はゴミ箱へ移動します（`--permanent` は使わないので 30 日間は Web 保管庫から復元可能）。
 - パスキーまたは添付ファイルを持つアイテムは、主アイテムにしない限り統合できません（失われるため）。
 
+## ダウンロード
+
+[Releases](https://github.com/ponkotuy/bitwarden-marger/releases/latest) から、使う OS のファイルをダウンロードして展開してください。
+
+| OS | ファイル |
+| --- | --- |
+| Windows (x86_64) | `bitwarden-merger-<version>-windows-x86_64.zip` |
+| macOS (Apple Silicon / Intel) | `bitwarden-merger-<version>-macos-universal.tar.gz` |
+| Linux (x86_64) | `bitwarden-merger-<version>-linux-x86_64.tar.gz` |
+
+- 展開した中の `bitwarden-merger`（Windows は `bitwarden-merger.exe`）が本体です。
+- チェックサムは `SHA256SUMS.txt` で確認できます。
+- macOS 版は署名していないため、初回は Gatekeeper にブロックされます。右クリック →「開く」で起動するか、次のコマンドで隔離属性を外してください。
+  ```sh
+  xattr -d com.apple.quarantine bitwarden-merger
+  ```
+
+ソースからビルドする場合は `cargo build --release` を実行します（Rust 1.85 以降が必要）。
+
 ## 使い方
 
 1. `bw` をインストールし、ターミナルで一度ログインしておきます。
@@ -19,7 +38,7 @@ Bitwarden の保管庫に大量にできてしまった「同じパスワード�
    bw config server https://your.server   # セルフホストの場合のみ
    bw login
    ```
-2. `cargo run --release` で起動し、マスターパスワードでロック解除します。
+2. `bitwarden-merger` を起動し（ソースからなら `cargo run --release`）、マスターパスワードでロック解除します。
 3. 左の候補グループを選び、統合するアイテムと主アイテムを選んで「マージ実行」。
 
 環境変数:
