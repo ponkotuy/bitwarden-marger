@@ -338,6 +338,19 @@ impl MergerApp {
         };
         ui.heading(group.title(&self.items));
         ui.label("同じパスワードを持つアイテムです。統合するものにチェックを入れ、残すアイテム（主）を選んでください。");
+        ui.horizontal(|ui| {
+            if ui.button("すべてチェック").clicked() {
+                self.checked = group
+                    .members
+                    .iter()
+                    .map(|&i| self.items[i].id.clone())
+                    .collect();
+            }
+            // 主アイテムは常に統合先なのでチェックを残す
+            if ui.button("すべて外す").clicked() {
+                self.checked.retain(|id| self.primary.as_deref() == Some(id));
+            }
+        });
         ui.add_space(6.0);
 
         egui::ScrollArea::vertical()
