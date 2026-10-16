@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui::text_edit::TextEditState;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::bw::StatusInfo;
+use crate::deadlink::{self, DeadItem, HostStatus, Target};
 use crate::merge::{MergeOptions, MergeRequest};
 use crate::model::{self, Group, LoginItem};
 use crate::secret::SecretInput;
@@ -17,6 +18,12 @@ enum Phase {
     Unauthenticated,
     Locked,
     Ready,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum View {
+    Merge,
+    Dead,
 }
 
 enum LogLevel {
@@ -39,6 +46,15 @@ pub struct MergerApp {
     primary: Option<String>,
     options: MergeOptions,
     confirming: bool,
+    view: View,
+    /// ドメイン確認の結果（未確認なら `None`）
+    host_status: Option<HashMap<Target, HostStatus>>,
+    dead: Vec<DeadItem>,
+    check_progress: Option<(usize, usize)>,
+    include_unreachable: bool,
+    dead_query: String,
+    /// ゴミ箱への移動を依頼中のアイテム ID
+    trashing: HashSet<String>,
     log: Vec<(LogLevel, String)>,
 }
 
@@ -59,10 +75,22 @@ impl MergerApp {
             primary: None,
             options: MergeOptions::default(),
             confirming: false,
+            view: View::Merge,
+            host_status: None,
+            dead: Vec::new(),
+            check_progress: None,
+            include_unreachable: true,
+            dead_query: String::new(),
+            trashing: HashSet::new(),
             log: Vec::new(),
         };
         app.request(Request::Status, "状態を確認しています…");
         app
+    }
+
+    /// 他の操作を受け付けられる状態か（ゴミ箱への移動待ちがあるときも不可）
+    fn idle(&self) -> bool {
+        self.busy.is_none() && self.trashing.is_empty()
     }
 
     fn request(&mut self, req: Request, busy: &'static str) {
@@ -80,7 +108,13 @@ impl MergerApp {
 
     fn handle_responses(&mut self) {
         while let Some(res) = self.worker.try_recv() {
-            self.busy = None;
+            // 進捗とゴミ箱移動は busy 表示を伴わないので、それ以外の応答でだけ解除する
+            if !matches!(
+                res,
+                Response::CheckProgress { .. } | Response::Trashed { .. }
+            ) {
+                self.busy = None;
+            }
             match res {
                 Response::Status(Ok(status)) => {
                     self.phase = if status.status == "unauthenticated" {
@@ -106,6 +140,7 @@ impl MergerApp {
                     self.info(format!("{} 件のログインを読み込みました", items.len()));
                     self.items = items;
                     self.rebuild_groups();
+                    self.refresh_dead();
                     self.phase = Phase::Ready;
                 }
                 Response::Loaded(Err(e)) => self.error(format!("読み込みに失敗しました: {e}")),
@@ -122,12 +157,32 @@ impl MergerApp {
                     self.request(Request::Load { sync: false }, "再読み込みしています…");
                 }
                 Response::Merged(Err(e)) => self.error(format!("マージに失敗しました: {e}")),
+                Response::CheckProgress { done, total } => {
+                    self.check_progress = Some((done, total));
+                }
+                Response::HostsChecked(results) => self.on_hosts_checked(results),
+                Response::Trashed { id, name, result } => {
+                    self.trashing.remove(&id);
+                    match result {
+                        Ok(()) => {
+                            self.info(format!("「{name}」をゴミ箱へ移動しました"));
+                            self.items.retain(|it| it.id != id);
+                            self.dead.retain(|d| d.id != id);
+                            self.rebuild_groups();
+                        }
+                        Err(e) => {
+                            self.error(format!("「{name}」をゴミ箱へ移動できませんでした: {e}"))
+                        }
+                    }
+                }
                 Response::Locked(result) => {
                     if let Err(e) = result {
                         self.error(format!("ロックに失敗しました: {e}"));
                     }
                     self.items.clear();
                     self.groups.clear();
+                    self.host_status = None;
+                    self.dead.clear();
                     self.select_group(None);
                     self.phase = Phase::Locked;
                 }
@@ -143,6 +198,42 @@ impl MergerApp {
         self.groups = model::build_groups(&self.items, self.by_username);
         let next = prev.and_then(|h| self.groups.iter().position(|g| g.password_hash == h));
         self.select_group(next);
+    }
+
+    fn refresh_dead(&mut self) {
+        self.dead = match &self.host_status {
+            Some(results) => deadlink::find_dead(&self.items, results),
+            None => Vec::new(),
+        };
+    }
+
+    fn start_host_check(&mut self) {
+        let targets = deadlink::collect_targets(&self.items);
+        if targets.is_empty() {
+            self.info("確認できる Web の URI がありません");
+            return;
+        }
+        self.check_progress = Some((0, targets.len()));
+        self.request(Request::CheckHosts(targets), "ドメインを確認しています…");
+    }
+
+    fn on_hosts_checked(&mut self, results: HashMap<Target, HostStatus>) {
+        self.check_progress = None;
+        let count = |s: HostStatus| results.values().filter(|&&v| v == s).count();
+        let (alive, no_dns, unreachable) = (
+            count(HostStatus::Alive),
+            count(HostStatus::NoDns),
+            count(HostStatus::Unreachable),
+        );
+        self.info(format!(
+            "{} ホストを確認しました（応答あり {alive} / 名前解決できない {no_dns} / 接続できない {unreachable}）",
+            results.len()
+        ));
+        if alive == 0 {
+            self.error("応答したホストがありません。ネットワークに接続されているか確認してください");
+        }
+        self.host_status = Some(results);
+        self.refresh_dead();
     }
 
     fn select_group(&mut self, index: Option<usize>) {
@@ -188,8 +279,13 @@ impl MergerApp {
                     status.server_url.as_deref().unwrap_or("bitwarden.com")
                 ));
             }
+            if self.phase == Phase::Ready {
+                ui.separator();
+                ui.selectable_value(&mut self.view, View::Merge, "マージ候補");
+                ui.selectable_value(&mut self.view, View::Dead, "リンク切れ");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let idle = self.busy.is_none();
+                let idle = self.idle();
                 if self.phase == Phase::Ready {
                     if ui.add_enabled(idle, egui::Button::new("ロック")).clicked() {
                         self.request(Request::Lock, "ロックしています…");
@@ -416,6 +512,145 @@ impl MergerApp {
             });
     }
 
+    fn dead_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("リンク切れのアイテム");
+        ui.label(
+            "各 URI のドメインを名前解決し、Web サーバー（443 / 80 番ポート等）へ接続できるかを確認します。\
+             Web の URI がすべて応答しないアイテムだけを表示します。",
+        );
+        ui.label(
+            RichText::new(
+                "確認のため DNS サーバーと各サイトへ通信が発生します。IP 直書きやローカルネットワークのホスト、アプリの URI は対象外です。",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let label = if self.host_status.is_some() {
+                "もう一度確認"
+            } else {
+                "ドメインを確認"
+            };
+            if ui
+                .add_enabled(self.idle(), egui::Button::new(label))
+                .clicked()
+            {
+                self.start_host_check();
+            }
+            if let Some((done, total)) = self.check_progress {
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .text(format!("{done} / {total}"))
+                        .desired_width(240.0),
+                );
+            }
+        });
+        if self.host_status.is_none() {
+            return;
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.dead_query)
+                    .hint_text("名前・ドメイン・ユーザー名で絞り込み"),
+            );
+            ui.checkbox(
+                &mut self.include_unreachable,
+                "接続できないだけのものも表示（一時的な障害やアクセス制限の可能性あり）",
+            );
+        });
+        let query = self.dead_query.to_lowercase();
+        let by_id: HashMap<&str, &LoginItem> =
+            self.items.iter().map(|it| (it.id.as_str(), it)).collect();
+        let visible: Vec<(&DeadItem, &LoginItem)> = self
+            .dead
+            .iter()
+            .filter(|d| self.include_unreachable || d.has_no_dns())
+            .filter_map(|d| Some((d, *by_id.get(d.id.as_str())?)))
+            .filter(|(d, item)| {
+                query.is_empty()
+                    || item.name.to_lowercase().contains(&query)
+                    || item
+                        .username
+                        .as_deref()
+                        .is_some_and(|u| u.to_lowercase().contains(&query))
+                    || d.hosts.iter().any(|(t, _)| t.host.contains(&query))
+            })
+            .collect();
+        ui.label(format!(
+            "{} 件（全 {} 件中）。「ゴミ箱へ」は 1 件ずつ移動します（30日間は Web 保管庫から復元できます）。",
+            visible.len(),
+            self.dead.len()
+        ));
+        ui.separator();
+
+        let can_trash = self.busy.is_none();
+        let mut clicked: Option<(String, String)> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("dead_items")
+                    .striped(true)
+                    .num_columns(5)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("");
+                        ui.strong("名前");
+                        ui.strong("ユーザー名");
+                        ui.strong("ドメインと判定");
+                        ui.strong("属性");
+                        ui.end_row();
+                        for (dead, item) in &visible {
+                            if self.trashing.contains(&item.id) {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("移動中…");
+                                });
+                            } else if ui
+                                .add_enabled(can_trash, egui::Button::new("ゴミ箱へ"))
+                                .clicked()
+                            {
+                                clicked = Some((item.id.clone(), item.name.clone()));
+                            }
+                            ui.label(&item.name);
+                            ui.label(item.username.as_deref().unwrap_or("-"));
+                            ui.vertical(|ui| {
+                                for (target, status) in &dead.hosts {
+                                    let color = match status {
+                                        HostStatus::NoDns => Color32::from_rgb(0xe0, 0x50, 0x50),
+                                        _ => Color32::from_rgb(0xd0, 0xa0, 0x20),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(target.to_string());
+                                        ui.colored_label(color, status.label());
+                                    });
+                                }
+                            });
+                            let mut tags = Vec::new();
+                            if item.organization_id.is_some() {
+                                tags.push("組織");
+                            }
+                            if item.totp_hash.is_some() {
+                                tags.push("TOTP");
+                            }
+                            if item.has_passkey {
+                                tags.push("パスキー");
+                            }
+                            if item.has_attachments {
+                                tags.push("添付");
+                            }
+                            ui.label(tags.join(" / "));
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some((id, name)) = clicked {
+            self.trashing.insert(id.clone());
+            self.worker.send(Request::Trash { id, name });
+        }
+    }
+
     /// 現在の選択から主アイテムと統合対象を取り出す。
     fn selection(&self) -> Option<(&LoginItem, Vec<&LoginItem>)> {
         let group = self.groups.get(self.selected_group?)?;
@@ -446,7 +681,7 @@ impl MergerApp {
         for w in &check.warnings {
             ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x20), format!("⚠ {w}"));
         }
-        let can_merge = check.errors.is_empty() && self.busy.is_none();
+        let can_merge = check.errors.is_empty() && self.idle();
         let other_count = others.len();
 
         ui.add_space(8.0);
@@ -548,14 +783,19 @@ impl eframe::App for MergerApp {
             Phase::Locked => {
                 egui::CentralPanel::default().show(ui, |ui| self.locked_view(ui));
             }
-            Phase::Ready => {
-                egui::Panel::left("groups")
-                    .resizable(true)
-                    .default_size(320.0)
-                    .show(ui, |ui| self.group_list(ui));
-                egui::CentralPanel::default().show(ui, |ui| self.group_detail(ui));
-                self.confirm_modal(&ctx);
-            }
+            Phase::Ready => match self.view {
+                View::Merge => {
+                    egui::Panel::left("groups")
+                        .resizable(true)
+                        .default_size(320.0)
+                        .show(ui, |ui| self.group_list(ui));
+                    egui::CentralPanel::default().show(ui, |ui| self.group_detail(ui));
+                    self.confirm_modal(&ctx);
+                }
+                View::Dead => {
+                    egui::CentralPanel::default().show(ui, |ui| self.dead_view(ui));
+                }
+            },
         }
     }
 }

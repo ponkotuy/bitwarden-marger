@@ -2,6 +2,7 @@
 
 mod app;
 mod bw;
+mod deadlink;
 mod fonts;
 mod merge;
 mod model;

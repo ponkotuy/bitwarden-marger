@@ -1,6 +1,7 @@
 //! `bw` の呼び出しは1回あたり数百ms〜数秒かかるため、専用スレッドで実行する。
 //! セッションキーとハッシュ鍵はこのスレッドだけが持ち、UI スレッドには渡らない。
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
@@ -8,6 +9,7 @@ use eframe::egui;
 use zeroize::Zeroizing;
 
 use crate::bw::{BwCli, StatusInfo};
+use crate::deadlink::{self, HostStatus, Target};
 use crate::merge::{self, MergeReport, MergeRequest};
 use crate::model::LoginItem;
 use crate::secret::SecretHasher;
@@ -17,6 +19,10 @@ pub enum Request {
     Unlock(Zeroizing<String>),
     Load { sync: bool },
     Merge(MergeRequest),
+    /// ホストの生死を確認する（`bw` は使わない）
+    CheckHosts(Vec<Target>),
+    /// アイテムをゴミ箱へ移動する
+    Trash { id: String, name: String },
     Lock,
 }
 
@@ -25,6 +31,13 @@ pub enum Response {
     Unlocked(Result<(), String>),
     Loaded(Result<Vec<LoginItem>, String>),
     Merged(Result<MergeReport, String>),
+    CheckProgress { done: usize, total: usize },
+    HostsChecked(HashMap<Target, HostStatus>),
+    Trashed {
+        id: String,
+        name: String,
+        result: Result<(), String>,
+    },
     Locked(Result<(), String>),
 }
 
@@ -78,6 +91,16 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, ctx: egui::Context) {
     };
 
     while let Ok(req) = rx.recv() {
+        let req = match req {
+            Request::CheckHosts(targets) => {
+                let results = deadlink::check_targets(&targets, |done, total| {
+                    reply(Response::CheckProgress { done, total });
+                });
+                reply(Response::HostsChecked(results));
+                continue;
+            }
+            other => other,
+        };
         let (bw, hasher) = match &mut init {
             Ok((bw, hasher)) => (bw, &*hasher),
             Err(e) => {
@@ -87,6 +110,12 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, ctx: egui::Context) {
                     Request::Unlock(_) => Response::Unlocked(Err(msg)),
                     Request::Load { .. } => Response::Loaded(Err(msg)),
                     Request::Merge(_) => Response::Merged(Err(msg)),
+                    Request::Trash { id, name } => Response::Trashed {
+                        id,
+                        name,
+                        result: Err(msg),
+                    },
+                    Request::CheckHosts(_) => unreachable!("handled above"),
                     Request::Lock => Response::Locked(Ok(())),
                 });
                 continue;
@@ -105,6 +134,11 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, ctx: egui::Context) {
                 .map_err(fmt),
             ),
             Request::Merge(req) => Response::Merged(merge::execute(bw, hasher, &req).map_err(fmt)),
+            Request::Trash { id, name } => {
+                let result = bw.delete_item(&id).map_err(fmt);
+                Response::Trashed { id, name, result }
+            }
+            Request::CheckHosts(_) => unreachable!("handled above"),
             Request::Lock => Response::Locked(bw.lock().map_err(fmt)),
         };
         reply(res);
