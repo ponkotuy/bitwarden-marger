@@ -1,7 +1,7 @@
 # Bitwarden Merger
 
 Bitwarden の保管庫に大量にできてしまった「同じパスワードのログインアイテム」を、
-1件にまとめる（URI を統合する）ためのデスクトップツールです。Rust + egui 製で Windows / macOS / Linux で動作します。
+1件にまとめる（URI を統合する）ためのデスクトップツールです。失効してるドメインのログインアイテムを削除する機能もあります。Rust + egui 製で Windows / macOS / Linux で動作します。
 
 ## 仕組み
 
